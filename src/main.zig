@@ -51,6 +51,17 @@ const ParseErrorContext = struct {
     }
 };
 
+const EnvEntry = struct {
+    name: []const u8,
+    value: []const u8,
+};
+fn lookup(env: []EnvEntry, name: []const u8) ?[]const u8 {
+    for (env) |entry| {
+        if (std.mem.eql(u8, name, entry.name)) return entry.value;
+    }
+    return null;
+}
+
 const EvalPart = union(enum) {
     literal: []const u8,
     varref: []const u8,
@@ -70,6 +81,45 @@ const EvalString = struct {
         }
         try writer.writeByte('"');
     }
+
+    pub fn eval(s: EvalString, alloc: *std.mem.Allocator, env: []EnvEntry) ![]u8 {
+        var buf = std.ArrayList(u8).init(alloc);
+        for (s.parts) |*part| {
+            switch (part.*) {
+                .literal => |value| try buf.appendSlice(value),
+                .varref => |name| {
+                    if (lookup(env, name)) |value| {
+                        try buf.appendSlice(value);
+                    }
+                },
+            }
+        }
+        return buf.items;
+    }
+};
+
+const Binding = struct {
+    name: []const u8,
+    val: EvalString,
+};
+const Bindings = struct {
+    vars: []Binding,
+};
+const Build = struct {
+    rule: []const u8,
+    ins: [][]const u8,
+    outs: [][]const u8,
+    bindings: Bindings,
+};
+const Rule = struct {
+    name: []const u8,
+    bindings: Bindings,
+};
+
+const Statement = union(enum) {
+    build: Build,
+    rule: Rule,
+    default: EvalString,
 };
 
 const ParseError = error{ParseError};
@@ -77,12 +127,14 @@ const Parser = struct {
     alloc: *std.mem.Allocator,
     cur: Cursor,
     err: *?ParseErrorContext,
+    env: std.ArrayList(EnvEntry),
 
     pub fn init(alloc: *std.mem.Allocator, c: Cursor, err: *?ParseErrorContext) Parser {
         return .{
             .alloc = alloc,
             .cur = c,
             .err = err,
+            .env = std.ArrayList(EnvEntry).init(alloc),
         };
     }
 
@@ -96,15 +148,18 @@ const Parser = struct {
                 const ident = try self.read_ident();
                 self.skip_spaces();
                 if (std.mem.eql(u8, ident, "build")) {
-                    try self.read_build();
+                    const build = try self.read_build();
+                    std.log.info("{s}", .{build});
                 } else if (std.mem.eql(u8, ident, "rule")) {
-                    try self.read_rule();
+                    const rule = try self.read_rule();
+                    std.log.info("{s}", .{rule});
                 } else if (std.mem.eql(u8, ident, "default")) {
                     _ = try self.read_path();
                     try self.expect('\n', "default");
                 } else {
                     const eval = try self.read_vardef();
-                    std.log.info("{s} = {s}", .{ ident, eval });
+                    const val = try eval.eval(self.alloc, self.env.items);
+                    try self.env.append(EnvEntry{.name = ident, .value = val});
                 }
             },
         }
@@ -127,18 +182,17 @@ const Parser = struct {
         self.cur.back();
     }
 
-    fn read_rule(self: *Parser) !void {
+    fn read_rule(self: *Parser) !Rule {
         const name = try self.read_ident();
-        _ = name;
         try self.expect('\n', "rule");
-        try self.read_indented();
+        const bindings = try self.read_indented();
+        return Rule{ .name = name, .bindings = bindings };
     }
 
-    fn read_build(self: *Parser) !void {
+    fn read_build(self: *Parser) !Build {
         while (true) {
             const path = (try self.read_path()) orelse break;
             std.log.info("path {s}", .{path});
-            self.skip_spaces();
         }
         try self.expect(':', "build colon");
         self.skip_spaces();
@@ -148,7 +202,6 @@ const Parser = struct {
         while (true) {
             const path = (try self.read_path()) orelse break;
             std.log.info("path {s}", .{path});
-            self.skip_spaces();
         }
 
         if (self.cur.peek() == '|') {
@@ -161,7 +214,6 @@ const Parser = struct {
                 while (true) {
                     const path = (try self.read_path()) orelse break;
                     std.log.info("path {s}", .{path});
-                    self.skip_spaces();
                 }
             }
         }
@@ -177,25 +229,25 @@ const Parser = struct {
             while (true) {
                 const path = (try self.read_path()) orelse break;
                 std.log.info("path {s}", .{path});
-                self.skip_spaces();
             }
         }
 
         try self.expect('\n', "build eol");
 
-        try self.read_indented();
-
-        std.log.info("build {s}", .{rule});
+        const bindings = try self.read_indented();
+        return Build{ .rule = rule, .ins = &.{}, .outs = &.{}, .bindings = bindings };
     }
 
-    fn read_indented(self: *Parser) !void {
+    fn read_indented(self: *Parser) !Bindings {
+        var vars = std.ArrayList(Binding).init(self.alloc);
         while (self.cur.peek() == ' ') {
             self.skip_spaces();
-            const varname = try self.read_ident();
+            const name = try self.read_ident();
             self.skip_spaces();
             const val = try self.read_vardef();
-            std.log.info("  {s}={s}", .{ varname, val });
+            try vars.append(Binding{ .name = name, .val = val });
         }
+        return Bindings{ .vars = vars.items };
     }
 
     fn read_ident(self: *Parser) ![]const u8 {
@@ -225,10 +277,11 @@ const Parser = struct {
         return eval;
     }
 
-    fn read_path(self: *Parser) !?EvalString {
+    fn read_path(self: *Parser) !?[]u8 {
         const eval = try self.read_eval(true);
         if (eval.parts.len == 0) return null;
-        return eval;
+        self.skip_spaces();
+        return try eval.eval(self.alloc, self.env.items);
     }
 
     fn read_eval(self: *Parser, comptime path: bool) !EvalString {
@@ -315,8 +368,7 @@ const Parser = struct {
 fn parse(alloc: *std.mem.Allocator, buf: *std.ArrayList(u8), err: *?ParseErrorContext) !void {
     var parser = Parser.init(alloc, Cursor.init(buf.items), err);
 
-    while (try parser.read_stmt()) {
-    }
+    while (try parser.read_stmt()) {}
 }
 
 pub fn main() anyerror!void {
